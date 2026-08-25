@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# QGIS plugin build artifacts
+*.zip
+
+# Cachés de datos generados en tiempo de ejecución
+dem_cache/
+*.tif.aux.xml
+
+# Entornos / editores
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

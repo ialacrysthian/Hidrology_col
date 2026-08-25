@@ -1,0 +1,26 @@
+[general]
+name=TC Calculator
+qgisMinimumVersion=3.16
+description=Delimitación de cuencas y subcuencas desde DEM, extracción de red de drenaje y selección de estaciones hidrometeorológicas IDEAM para el cálculo del Tiempo de Concentración.
+version=0.1.0
+author=C. Sanchez
+email=cdsanchezingenieria@gmail.com
+
+about=Plugin para Colombia que permite:
+    - Delimitar cuencas hidrográficas desde DEM SRTM usando algoritmos D8
+    - Extraer red de drenaje con umbral FAT configurable
+    - Delinear subcuencas automáticamente
+    - Seleccionar estaciones IDEAM (precipitación, temperatura, caudal)
+      con buffer configurable alrededor de la cuenca
+    - Base para cálculo de Tiempo de Concentración (TC)
+
+tracker=https://github.com/cdsanchez/tc_calculator/issues
+repository=https://github.com/cdsanchez/tc_calculator
+
+hasProcessingProvider=no
+tags=hydrology,watershed,time of concentration,IDEAM,Colombia,DEM,drainage
+homepage=https://github.com/cdsanchez/tc_calculator
+category=Raster
+icon=ui/resources/icons/plugin_icon.png
+experimental=True
+deprecated=False

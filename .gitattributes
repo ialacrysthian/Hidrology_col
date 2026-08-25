@@ -1,2 +1,21 @@
-# Auto detect text files and perform LF normalization
-* text=auto
+# Normaliza todo a LF en el repo; Git lo convierte a CRLF solo al hacer
+# checkout en Windows si tu core.autocrlf está en true/input.
+* text=auto eol=lf
+
+# Binarios: nunca tocar line endings
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.tif binary
+*.tiff binary
+*.pdf binary
+*.zip binary
+*.shp binary
+*.shx binary
+*.dbf binary
+*.prj text
+*.qpj text
+*.xls binary
+*.xlsx binary
