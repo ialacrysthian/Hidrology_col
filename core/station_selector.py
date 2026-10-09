@@ -205,11 +205,25 @@ class StationSelector:
         # Distancia al borde de la cuenca (negativa = dentro).
         # Se usa .boundary y no .exterior: la cuenca vectorizada por GRASS
         # puede ser MultiPolygon, que no tiene atributo .exterior.
+        #
+        # Si no hay ninguna estación dentro del buffer (caso real y común:
+        # zona sin cobertura de esa variable, buffer chico, etc.),
+        # result_proj queda vacío. GeoSeries.apply() sobre una selección
+        # VACÍA no tiene elementos de los que inferir el tipo y conserva el
+        # dtype geometry en vez de devolver floats — "dist_m" queda como un
+        # GeometryArray vacío en lugar de una Serie numérica, y
+        # "dist_m / 1000.0" revienta con
+        # "unsupported operand type(s) for /: 'GeometryArray' and 'float'".
+        # Eso enmascaraba el problema real (0 estaciones) detrás de un
+        # TypeError. Se construye la Serie vacía explícitamente en ese caso.
         borde = poly_proj.boundary
-        dist_m = result_proj.geometry.apply(
-            lambda geom: borde.distance(geom)
-            if not poly_proj.contains(geom) else -borde.distance(geom)
-        )
+        if result_proj.empty:
+            dist_m = pd.Series([], dtype=float, index=result_proj.index)
+        else:
+            dist_m = result_proj.geometry.apply(
+                lambda geom: borde.distance(geom)
+                if not poly_proj.contains(geom) else -borde.distance(geom)
+            )
         result["DIST_KM"] = (dist_m / 1000.0).round(2)
 
         # --- Filtros de atributo ---
@@ -227,7 +241,15 @@ class StationSelector:
                 lambda c: self._normalizar(c) in cats_norm
                 or c.strip() in cats_efectivas
             )
-            result = result[mask_cat]
+            # Mismo problema que con dist_m más arriba: sobre un "result"
+            # ya vacío (por el filtro de estado, p.ej.), .apply() devuelve
+            # dtype object en vez de bool. df[mascara_no_bool] NO filtra
+            # filas: pandas la trata como una lista de nombres de columna,
+            # y al estar vacía borra TODAS las columnas (no solo las filas)
+            # — el resultado queda sin 'DIST_KM' y el sort_values de abajo
+            # revienta con un KeyError que no tiene nada que ver con la
+            # causa real. .astype(bool) fuerza el filtrado por filas.
+            result = result[mask_cat.astype(bool)]
 
         if tecnologia:
             tec_norm = {t.lower() for t in tecnologia}

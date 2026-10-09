@@ -12,6 +12,68 @@ log = get_logger(__name__)
 gdal.UseExceptions()
 
 
+def rasterize_attribute(
+    dem_path: str,
+    input_path: str,
+    output_raster: str,
+    attribute: str,
+    layer: str | None = None,
+) -> str:
+    """Rasteriza un atributo numérico de una capa vectorial al *grid* del DEM.
+
+    Función independiente (usada por ``LandCoverProcessor._rasterize`` y por
+    ``core/soil_hydrologic.py``) para no duplicar el manejo de GDAL/OGR entre
+    ambos módulos. ``input_path`` puede ser un Shapefile (``layer=None``) o
+    un GeoPackage con varias capas (``layer`` obligatorio en ese caso).
+    """
+    ds = gdal.Open(dem_path, gdal.GA_ReadOnly)
+    if ds is None:
+        raise RuntimeError(f"No se puede abrir el DEM: {dem_path}")
+
+    geotransform = ds.GetGeoTransform()
+    projection = ds.GetProjection()
+    cols = ds.RasterXSize
+    rows = ds.RasterYSize
+    ds = None
+
+    driver = gdal.GetDriverByName("GTiff")
+    out = driver.Create(
+        output_raster,
+        cols,
+        rows,
+        1,
+        gdal.GDT_Float32,
+        options=["COMPRESS=LZW", "TILED=YES"],
+    )
+    out.SetGeoTransform(geotransform)
+    out.SetProjection(projection)
+    band = out.GetRasterBand(1)
+    nodata = -9999.0
+    band.SetNoDataValue(nodata)
+    band.Fill(nodata)
+
+    vector_ds = ogr.Open(input_path)
+    if vector_ds is None:
+        raise RuntimeError(f"No se puede abrir la capa vectorial: {input_path}")
+    vec_layer = vector_ds.GetLayerByName(layer) if layer else vector_ds.GetLayer()
+    if vec_layer is None:
+        raise RuntimeError(f"No se encontró la capa '{layer}' en: {input_path}")
+    gdal.RasterizeLayer(
+        out,
+        [1],
+        vec_layer,
+        options=[f"ATTRIBUTE={attribute}", "ALL_TOUCHED=TRUE"],
+    )
+    band.FlushCache()
+    try:
+        band.ComputeStatistics(False)
+    except Exception:
+        pass
+    out = None
+    vector_ds = None
+    return output_raster
+
+
 class LandCoverProcessor:
     def __init__(
         self,
@@ -211,50 +273,4 @@ class LandCoverProcessor:
         attribute: str,
     ) -> str:
         self._cb(f"Rasterizando cobertura con valores de {attribute}...")
-        ds = gdal.Open(self.dem_path, gdal.GA_ReadOnly)
-        if ds is None:
-            raise RuntimeError(f"No se puede abrir el DEM: {self.dem_path}")
-
-        geotransform = ds.GetGeoTransform()
-        projection = ds.GetProjection()
-        cols = ds.RasterXSize
-        rows = ds.RasterYSize
-        ds = None
-
-        driver = gdal.GetDriverByName("GTiff")
-        out = driver.Create(
-            output_raster,
-            cols,
-            rows,
-            1,
-            gdal.GDT_Float32,
-            options=["COMPRESS=LZW", "TILED=YES"],
-        )
-        out.SetGeoTransform(geotransform)
-        out.SetProjection(projection)
-        band = out.GetRasterBand(1)
-        nodata = -9999.0
-        band.SetNoDataValue(nodata)
-        band.Fill(nodata)
-
-        vector_ds = ogr.Open(input_shp)
-        if vector_ds is None:
-            raise RuntimeError(f"No se puede abrir el shapefile: {input_shp}")
-        layer = vector_ds.GetLayer()
-        gdal.RasterizeLayer(
-            out,
-            [1],
-            layer,
-            options=[f"ATTRIBUTE={attribute}", "ALL_TOUCHED=TRUE"],
-        )
-        band.FlushCache()
-        # Estadísticas embebidas (excluyen NoData). Sin ellas QGIS no puede
-        # estimar min/max y estira la simbología a ±3.4e38 (rango Float32),
-        # mostrando el raster como si tuviera valores absurdos.
-        try:
-            band.ComputeStatistics(False)
-        except Exception:
-            pass
-        out = None
-        vector_ds = None
-        return output_raster
+        return rasterize_attribute(self.dem_path, input_shp, output_raster, attribute)

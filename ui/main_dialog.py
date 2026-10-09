@@ -200,6 +200,14 @@ class StepCard(QWidget):
 # ═══════════════════════════════════════════════════════════════════════
 #  Tarea 2 — Calcular flujo acumulado
 # ═══════════════════════════════════════════════════════════════════════
+#
+# NO SE USA (ver _on_calc_flow). r.fill.dir/r.watershed (proveedor GRASS)
+# no son seguros de invocar desde un QgsTask: QGIS termina bloqueando el
+# hilo principal esperando al subproceso de GRASS igual, y la app queda
+# "sin responder" durante horas sin forma de cancelar. _on_calc_flow llama
+# a WatershedDelineator directamente en el hilo principal en su lugar.
+# Esta clase se conserva solo como referencia del patrón QgsTask usado en
+# el resto del asistente.
 
 class FlowAccumulationTask(QgsTask):
     progress_message = pyqtSignal(str)
@@ -241,6 +249,10 @@ class FlowAccumulationTask(QgsTask):
 # ═══════════════════════════════════════════════════════════════════════
 #  Tarea 4 — Delimitar cuenca
 # ═══════════════════════════════════════════════════════════════════════
+#
+# NO SE USA (ver _on_delineate) — mismo motivo que FlowAccumulationTask:
+# r.water.outlet/r.to.vect también son GRASS y no son seguros dentro de
+# un QgsTask.
 
 class WatershedDelimitationTask(QgsTask):
     progress_message = pyqtSignal(str)
@@ -486,6 +498,123 @@ class LandCoverClipTask(QgsTask):
         pass
 
 
+class SoilClipTask(QgsTask):
+    """Recorta la capa de suelos a la cuenca (mismo patrón que
+    LandCoverClipTask): se cachea el GeoDataFrame recortado para poblar el
+    combo de campos y la tabla de clasificación A/B/C/D sin releer el shapefile."""
+    progress_message = pyqtSignal(str)
+    finished_ok      = pyqtSignal(str, object)   # (gpkg_path, [campos])
+    finished_err     = pyqtSignal(str)
+
+    def __init__(
+        self,
+        soil_shp: str,
+        watershed_shp: str,
+        watershed_crs_wkt: str | None,
+        output_gpkg: str,
+    ) -> None:
+        super().__init__("TC — Recortar suelos", QgsTask.CanCancel)
+        self.soil_shp = soil_shp
+        self.watershed_shp = watershed_shp
+        self.watershed_crs_wkt = watershed_crs_wkt
+        self.output_gpkg = output_gpkg
+        self.clipped_gdf = None
+
+    def run(self) -> bool:
+        import traceback
+        try:
+            from ..core.soil_hydrologic import SoilHydrologicProcessor
+
+            self.progress_message.emit("Leyendo y recortando los suelos a la cuenca...")
+            clipped = SoilHydrologicProcessor.clip_to_watershed(
+                self.soil_shp, self.watershed_shp, self.watershed_crs_wkt,
+            )
+            if clipped.empty:
+                raise RuntimeError(
+                    "Los suelos no intersectan con la cuenca. "
+                    "Verifique el shapefile y su CRS."
+                )
+            os.makedirs(os.path.dirname(self.output_gpkg), exist_ok=True)
+            clipped.to_file(self.output_gpkg, driver="GPKG", layer="suelos")
+            self.clipped_gdf = clipped
+            fields = [c for c in clipped.columns if c != "geometry"]
+            self.progress_message.emit(
+                f"Recorte listo: {len(clipped)} polígonos, {len(fields)} campos"
+            )
+            self.finished_ok.emit(self.output_gpkg, fields)
+            return True
+        except Exception as exc:
+            detail = traceback.format_exc()
+            log.error(f"SoilClipTask:\n{detail}")
+            self.finished_err.emit(f"{exc}\n\nDetalle:\n{detail}")
+            return False
+
+    def finished(self, result: bool) -> None:
+        pass
+
+
+class SoilCnTask(QgsTask):
+    """Paso 4 (suelos) — asigna condición hidrológica A/B/C/D, intersecta con
+    la cobertura (campos CN_A/CN_B/CN_C/CN_D) y genera la capa/raster
+    CN_final. Ver core/soil_hydrologic.py::SoilHydrologicProcessor."""
+    progress_message = pyqtSignal(str)
+    finished_ok      = pyqtSignal(object)   # SoilCnResult
+    finished_err     = pyqtSignal(str)
+
+    def __init__(
+        self,
+        soil_shp: str,
+        watershed_shp: str,
+        dem_path: str,
+        output_dir: str,
+        soil_field: str,
+        condition_map: dict[str, str],
+        coverage_gdf,
+        cn_field_map: dict[str, str],
+        watershed_crs_wkt: str | None = None,
+    ) -> None:
+        super().__init__("TC — Calcular CN final (suelos + cobertura)", QgsTask.CanCancel)
+        self.soil_shp = soil_shp
+        self.watershed_shp = watershed_shp
+        self.dem_path = dem_path
+        self.output_dir = output_dir
+        self.soil_field = soil_field
+        self.condition_map = condition_map
+        self.coverage_gdf = coverage_gdf
+        self.cn_field_map = cn_field_map
+        self.watershed_crs_wkt = watershed_crs_wkt
+
+    def run(self) -> bool:
+        import traceback
+        try:
+            from ..core.soil_hydrologic import SoilHydrologicProcessor
+
+            processor = SoilHydrologicProcessor(
+                soil_shp      = self.soil_shp,
+                watershed_shp = self.watershed_shp,
+                dem_path      = self.dem_path,
+                output_dir    = self.output_dir,
+                progress_cb   = self.progress_message.emit,
+            )
+            result = processor.compute_cn_final(
+                soil_field        = self.soil_field,
+                condition_map     = self.condition_map,
+                coverage_gdf      = self.coverage_gdf,
+                cn_field_map      = self.cn_field_map,
+                watershed_crs_wkt = self.watershed_crs_wkt,
+            )
+            self.finished_ok.emit(result)
+            return True
+        except Exception as exc:
+            detail = traceback.format_exc()
+            log.error(f"SoilCnTask:\n{detail}")
+            self.finished_err.emit(f"{exc}\n\nDetalle:\n{detail}")
+            return False
+
+    def finished(self, result: bool) -> None:
+        pass
+
+
 class DistributedTcTask(QgsTask):
     progress_message = pyqtSignal(str)
     finished_ok      = pyqtSignal(object)
@@ -643,11 +772,16 @@ class MainDialog(QDockWidget):
         self._land_cover_cn_raster_path: str | None = None
         self._land_cover_clip_path: str | None = None   # GPKG del recorte
         self._land_cover_clip_gdf = None                # cache en memoria
+        self._soil_path: str | None = None
+        self._soil_clip_path: str | None = None   # GPKG del recorte de suelos
+        self._soil_clip_gdf = None                # cache en memoria
+        self._soil_cn_result = None               # SoilCnResult del último cálculo
         self._morphometry_csv: str | None = None
         self._tc_adopted_min: float | None = None   # Tc Kirpich — semilla p/ iteración
         self._delineator               = None   # cache de flujo entre pasos
         self._outlet_tool              = None
         self._active_task              = None   # evita garbage collection
+        self._sync_cancel_requested    = False  # cancelación cooperativa (pasos 2 y 3, sin QgsTask)
         self._progress_dialog           = None
         self._log_messages: list[str] = []
         self._mode = cfg.get(cfg.Keys.PROGRESS_MODE) or "professional"
@@ -795,6 +929,54 @@ class MainDialog(QDockWidget):
         grp_cover = QGroupBox()
         lc = QVBoxLayout(grp_cover)
 
+        # -- Suelos y condición hidrológica (opcional, para CN por SCS) --
+        lbl_soil_section = QLabel(
+            "Suelos y condición hidrológica (opcional — para CN por método SCS)"
+        )
+        lbl_soil_section.setStyleSheet("font-weight:bold;color:#555;")
+        lc.addWidget(lbl_soil_section)
+
+        row_soil = QHBoxLayout()
+        self.edit_soil = QLineEdit("")
+        self.edit_soil.setPlaceholderText("Shapefile de suelos...")
+        btn_soil_browse = QPushButton("...")
+        btn_soil_browse.setFixedWidth(32)
+        btn_soil_browse.clicked.connect(self._on_browse_soil)
+        self.btn_load_soil = QPushButton("Cargar")
+        self.btn_load_soil.setFixedWidth(70)
+        self.btn_load_soil.setEnabled(False)
+        row_soil.addWidget(self.edit_soil, 1)
+        row_soil.addWidget(btn_soil_browse)
+        row_soil.addWidget(self.btn_load_soil)
+        lc.addLayout(row_soil)
+
+        row_soil_field = QHBoxLayout()
+        lbl_soil_field = QLabel("Campo de clasificación del suelo:")
+        row_soil_field.addWidget(lbl_soil_field)
+        self.combo_soil_field = QComboBox()
+        self.combo_soil_field.setEnabled(False)
+        row_soil_field.addWidget(self.combo_soil_field, 1)
+        lc.addLayout(row_soil_field)
+
+        self.table_soil_condition = QTableWidget(0, 2)
+        self.table_soil_condition.setHorizontalHeaderLabels(
+            ["Valor de suelo", "Condición hidrológica"]
+        )
+        self.table_soil_condition.setFixedHeight(120)
+        lc.addWidget(self.table_soil_condition)
+
+        self.lbl_soil = QLabel(
+            "Sin capa de suelos cargada — el CN se calculará solo con la "
+            "tabla Categoría/CN de la cobertura (flujo anterior)."
+        )
+        self.lbl_soil.setWordWrap(True)
+        self.lbl_soil.setStyleSheet("color:#888;font-style:italic;")
+        lc.addWidget(self.lbl_soil)
+
+        lbl_cover_section = QLabel("Cobertura de tierra")
+        lbl_cover_section.setStyleSheet("font-weight:bold;color:#555;")
+        lc.addWidget(lbl_cover_section)
+
         row_cover = QHBoxLayout()
         self.edit_land_cover = QLineEdit("")
         self._reg(self.edit_land_cover, "ph_landcover", "setPlaceholderText")
@@ -818,6 +1000,20 @@ class MainDialog(QDockWidget):
         self.combo_cover_field.setEnabled(False)
         row_field.addWidget(self.combo_cover_field, 1)
         lc.addLayout(row_field)
+
+        # Campos de CN por condición hidrológica (A/B/C/D) EN la propia
+        # capa de cobertura -- solo necesarios si se cargó una capa de
+        # suelos y se le asignó condición hidrológica (paso anterior).
+        row_cn_fields = QHBoxLayout()
+        self.combo_cn_fields: dict[str, QComboBox] = {}
+        for cond in ("A", "B", "C", "D"):
+            row_cn_fields.addWidget(QLabel(f"CN_{cond}:"))
+            combo = QComboBox()
+            combo.setEnabled(False)
+            combo.setMinimumWidth(70)
+            self.combo_cn_fields[cond] = combo
+            row_cn_fields.addWidget(combo)
+        lc.addLayout(row_cn_fields)
 
         self.table_manning = QTableWidget(0, 3)
         _cov_headers = lambda: [i18n.tr("col_category"), "Manning", "CN"]
@@ -850,6 +1046,15 @@ class MainDialog(QDockWidget):
         self._reg(self.lbl_cover, "lbl_cover_empty")
         self.lbl_cover.setStyleSheet("color:#888;font-style:italic;")
         lc.addWidget(self.lbl_cover)
+
+        self.btn_calc_cn_final = QPushButton("Calcular CN final (suelos + cobertura)")
+        self.btn_calc_cn_final.setEnabled(False)
+        lc.addWidget(self.btn_calc_cn_final)
+
+        self.lbl_cn_final = QLabel()
+        self.lbl_cn_final.setWordWrap(True)
+        self.lbl_cn_final.setStyleSheet("color:#888;font-style:italic;")
+        lc.addWidget(self.lbl_cn_final)
 
         lay.addWidget(self._wrap_step(4, "step4_title", grp_cover))
 
@@ -978,11 +1183,14 @@ class MainDialog(QDockWidget):
         self.btn_calc_flow.clicked.connect(self._on_calc_flow)
         self.btn_outlet.clicked.connect(self._on_pick_outlet)
         self.btn_delineate.clicked.connect(self._on_delineate)
+        self.btn_load_soil.clicked.connect(self._on_load_soil)
+        self.combo_soil_field.currentIndexChanged.connect(self._on_soil_field_selected)
         self.btn_load_land_cover.clicked.connect(self._on_load_land_cover)
         self.combo_cover_field.currentIndexChanged.connect(self._on_cover_field_selected)
         self.btn_add_manning.clicked.connect(self._on_add_manning_row)
         self.btn_remove_manning.clicked.connect(self._on_remove_manning_row)
         self.btn_process_cover.clicked.connect(self._on_process_land_cover)
+        self.btn_calc_cn_final.clicked.connect(self._on_calc_cn_final)
         self.btn_stations.clicked.connect(self._on_find_stations)
         self.btn_morphometry.clicked.connect(self._on_calc_morphometry)
         self._shortcut_toggle_mode = QShortcut(QKeySequence("Ctrl+Shift+W"), self)
@@ -1090,6 +1298,17 @@ class MainDialog(QDockWidget):
                 self._on_cover_field_selected(0)
             else:
                 self._log("La cobertura recortada no contiene campos de atributo.")
+
+            # Campos CN_A/B/C/D (paso de suelos): mismos campos de la
+            # cobertura recortada, el usuario elige cuál corresponde a cada
+            # condición hidrológica. Se intenta preseleccionar por nombre.
+            for cond, combo in self.combo_cn_fields.items():
+                combo.clear()
+                combo.addItems([""] + fields)
+                combo.setEnabled(bool(fields))
+                guess = next((f for f in fields if f.upper() in (f"CN_{cond}", f"CN{cond}")), None)
+                if guess:
+                    combo.setCurrentText(guess)
             self._update_buttons()
             self._save_session()
         except RuntimeError:
@@ -1220,6 +1439,267 @@ class MainDialog(QDockWidget):
         except RuntimeError:
             pass
 
+    # ------------------------------------------------------------------
+    # Paso 4 (suelos) — condición hidrológica A/B/C/D y CN final
+    # ------------------------------------------------------------------
+
+    def _on_browse_soil(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Seleccionar capa de suelos",
+            self.edit_soil.text() or os.path.expanduser("~"),
+            "SHP (*.shp);;Todos los archivos (*)",
+        )
+        if path:
+            self.edit_soil.setText(path)
+            self.btn_load_soil.setEnabled(True)
+
+    def _on_load_soil(self) -> None:
+        path = self.edit_soil.text().strip()
+        if not path or not os.path.exists(path):
+            self._log("Seleccione un shapefile de suelos válido.")
+            return
+        if not self._ws_result or not os.path.exists(self._ws_result.cuenca_shp):
+            self._log(
+                "Delimite la cuenca primero (paso 3): los suelos se "
+                "recortan a la cuenca antes de clasificarlos."
+            )
+            return
+        out = self._output_dir()
+        if not out:
+            return
+
+        self._soil_path = path
+        self._soil_clip_path = None
+        self._soil_clip_gdf = None
+        self._soil_cn_result = None
+        self.combo_soil_field.clear()
+        self.combo_soil_field.setEnabled(False)
+        self.table_soil_condition.setRowCount(0)
+        self._log(f"Capa de suelos: {path}")
+
+        crs_wkt = (
+            self._crs_manager.dem_crs.toWkt()
+            if self._crs_manager is not None else None
+        )
+        self.btn_load_soil.setEnabled(False)
+        self._active_task = SoilClipTask(
+            soil_shp          = path,
+            watershed_shp     = self._ws_result.cuenca_shp,
+            watershed_crs_wkt = crs_wkt,
+            output_gpkg       = os.path.join(out, "suelos", "suelos_clip.gpkg"),
+        )
+        self._active_task.progress_message.connect(self._on_soil_progress)
+        self._active_task.finished_ok.connect(self._on_soil_clip_ready)
+        self._active_task.finished_err.connect(
+            lambda e: self._show_progress_error("Recorte de suelos", e)
+        )
+        self._show_progress_dialog("Recortar suelos a la cuenca", step=1, total=1)
+        QgsApplication.taskManager().addTask(self._active_task)
+
+    def _on_soil_progress(self, msg: str) -> None:
+        self._log(msg)
+        if not self._alive():
+            return
+        value, subtitle = self._parse_task_progress(msg, task="soil")
+        self._update_progress(value, subtitle or msg)
+
+    def _on_soil_clip_ready(self, gpkg_path: str, fields: list) -> None:
+        self._soil_clip_gdf = getattr(self._active_task, "clipped_gdf", None)
+        self._active_task = None
+        self._soil_clip_path = gpkg_path
+        if not self._alive():
+            return
+        try:
+            self._close_progress_dialog()
+            self.btn_load_soil.setEnabled(True)
+            n = len(self._soil_clip_gdf) if self._soil_clip_gdf is not None else 0
+            self.lbl_soil.setText(
+                f"Suelos recortados: {n} polígonos en la cuenca. Seleccione el "
+                "campo de clasificación y asigne A/B/C/D a cada valor."
+            )
+            self.lbl_soil.setStyleSheet("color:#2a7a2a;font-weight:bold;")
+
+            self.combo_soil_field.clear()
+            self.combo_soil_field.addItems(fields)
+            self.combo_soil_field.setEnabled(bool(fields))
+            if fields:
+                self.combo_soil_field.setCurrentIndex(0)
+                self._log(f"Campos de suelo disponibles: {', '.join(fields)}")
+                self._on_soil_field_selected(0)
+            else:
+                self._log("La capa de suelos recortada no contiene campos de atributo.")
+            self._update_buttons()
+            self._save_session()
+        except RuntimeError:
+            pass
+
+    def _on_soil_field_selected(self, index: int) -> None:
+        soil_gdf = self._soil_gdf()
+        if soil_gdf is None:
+            return
+        field = self.combo_soil_field.currentText().strip()
+        if not field or field not in soil_gdf.columns:
+            return
+        try:
+            from ..core.soil_hydrologic import SoilHydrologicProcessor
+            values = SoilHydrologicProcessor.unique_values(soil_gdf, field)
+        except Exception as exc:
+            self._log(f"Error al leer valores únicos de suelo: {exc}")
+            return
+
+        self.table_soil_condition.setRowCount(0)
+        for value in values:
+            row = self.table_soil_condition.rowCount()
+            self.table_soil_condition.insertRow(row)
+            item = QTableWidgetItem(str(value))
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+            self.table_soil_condition.setItem(row, 0, item)
+            combo = QComboBox()
+            combo.addItems(["", "A", "B", "C", "D"])
+            self.table_soil_condition.setCellWidget(row, 1, combo)
+        self._log(f"{len(values)} valores únicos en '{field}' — asigne su condición hidrológica.")
+        self._update_buttons()
+
+    def _read_soil_condition_table(self) -> dict[str, str]:
+        """Lee la tabla Valor de suelo / Condición hidrológica. Filas sin
+        condición seleccionada (combo vacío) se omiten del mapeo — quedan
+        como 'sin clasificar' y SoilHydrologicProcessor las reporta y
+        excluye antes de intersectar."""
+        mapping: dict[str, str] = {}
+        for row in range(self.table_soil_condition.rowCount()):
+            item_val = self.table_soil_condition.item(row, 0)
+            combo = self.table_soil_condition.cellWidget(row, 1)
+            if item_val is None or combo is None:
+                continue
+            value = item_val.text().strip()
+            condition = combo.currentText().strip()
+            if value and condition:
+                mapping[value] = condition
+        return mapping
+
+    def _on_calc_cn_final(self) -> None:
+        if self._soil_gdf() is None or not self._soil_path:
+            self._log("Cargue y clasifique la capa de suelos antes de calcular el CN final.")
+            return
+        coverage_gdf = self._clip_gdf()
+        if coverage_gdf is None:
+            self._log("Cargue la cobertura (y espere el recorte) antes de calcular el CN final.")
+            return
+        if not self._ws_result:
+            self._log("Delimite la cuenca primero (paso 3).")
+            return
+
+        soil_field = self.combo_soil_field.currentText().strip()
+        if not soil_field:
+            self._log("Seleccione el campo de clasificación del suelo.")
+            return
+
+        condition_map = self._read_soil_condition_table()
+        if not condition_map:
+            self._log(
+                "Asigne al menos una condición hidrológica (A/B/C/D) a un "
+                "valor de suelo antes de calcular el CN final."
+            )
+            return
+
+        cn_field_map = {
+            cond: combo.currentText().strip()
+            for cond, combo in self.combo_cn_fields.items()
+            if combo.currentText().strip()
+        }
+        if not cn_field_map:
+            self._log(
+                "Seleccione, para al menos una condición hidrológica (CN_A/CN_B/"
+                "CN_C/CN_D), el campo de la cobertura que contiene su valor de CN."
+            )
+            return
+
+        out = self._output_dir()
+        if not out:
+            return
+
+        crs_wkt = (
+            self._crs_manager.dem_crs.toWkt()
+            if self._crs_manager is not None else None
+        )
+        self.btn_calc_cn_final.setEnabled(False)
+        self._log("Calculando CN final (intersección suelos x cobertura)...")
+
+        self._active_task = SoilCnTask(
+            soil_shp          = self._soil_clip_path or self._soil_path,
+            watershed_shp     = self._ws_result.cuenca_shp,
+            dem_path          = self._dem_path,
+            output_dir        = os.path.join(out, "suelos"),
+            soil_field        = soil_field,
+            condition_map     = condition_map,
+            coverage_gdf      = coverage_gdf,
+            cn_field_map      = cn_field_map,
+            watershed_crs_wkt = crs_wkt,
+        )
+        self._active_task.progress_message.connect(self._on_soil_progress)
+        self._active_task.finished_ok.connect(self._on_cn_final_ready)
+        self._active_task.finished_err.connect(
+            lambda e: self._show_progress_error("CN final", e)
+        )
+        self._show_progress_dialog("Calcular CN final", step=1, total=1)
+        QgsApplication.taskManager().addTask(self._active_task)
+
+    def _on_cn_final_ready(self, result) -> None:
+        self._active_task = None
+        self._soil_cn_result = result
+        if not self._alive():
+            return
+        try:
+            self._close_progress_dialog()
+            self.btn_calc_cn_final.setEnabled(True)
+            self._set_status("Completado", "CN final calculado (suelos x cobertura).")
+            self._log(f"Suelos con condición hidrológica: {result.soil_shp}")
+            self._log(f"CN_final: {result.cn_final_shp} ({result.n_polygons} polígonos)")
+            self._log(f"Raster CN_final: {result.cn_final_raster}")
+
+            warnings = []
+            if result.n_unclassified_soil:
+                warnings.append(
+                    f"{result.n_unclassified_soil} polígonos de suelo sin clasificar "
+                    f"({', '.join(map(str, result.unclassified_values))}) — excluidos."
+                )
+            if result.n_sin_cn:
+                warnings.append(f"{result.n_sin_cn} polígonos de la intersección sin CN asignado.")
+            for w in warnings:
+                self._log(f"  Advertencia: {w}")
+
+            if os.path.exists(result.cn_final_shp):
+                self._load_shp(
+                    result.cn_final_shp, "CN_final",
+                    fill="0,150,200,60", stroke="0,100,150", poly=True,
+                )
+            if os.path.exists(result.cn_final_raster):
+                rl = QgsRasterLayer(result.cn_final_raster, "CN_final (raster)")
+                if rl.isValid():
+                    QgsProject.instance().addMapLayer(rl)
+                    # El CN final por suelos+cobertura reemplaza al CN simple
+                    # de la cobertura como fuente para la extracción automática
+                    # en el paso de morfometría (fórmula SCS).
+                    self._land_cover_cn_raster_path = result.cn_final_raster
+                else:
+                    self._log("No se pudo cargar el raster de CN_final al mapa.")
+
+            resumen = (
+                f"CN_final: {result.n_polygons} polígonos · "
+                f"suelo {result.area_suelo_km2:.1f} km² · "
+                f"cobertura {result.area_cobertura_km2:.1f} km²"
+            )
+            if warnings:
+                resumen += f" · {len(warnings)} advertencia(s) (ver log)"
+            self.lbl_cn_final.setText(resumen)
+            self.lbl_cn_final.setStyleSheet(
+                "color:#b8860b;font-weight:bold;" if warnings else "color:#2a7a2a;font-weight:bold;"
+            )
+            self._update_buttons()
+            self._save_session()
+        except RuntimeError:
+            pass
+
     def _set_dem(self, path: str) -> None:
         self._dem_path = path
         nombre = os.path.basename(path)
@@ -1265,19 +1745,45 @@ class MainDialog(QDockWidget):
         self.btn_calc_flow.setEnabled(False)
         self._log(f"Calculando flujo acumulado (FAT = {fat} celdas)...")
         self._set_status("Calculando flujo", "Iniciando cálculo de flujo acumulado...")
-
-        self._active_task = FlowAccumulationTask(
-            dem_path   = self._dem_path,
-            output_dir = out,
-            fat        = fat,
-        )
-        self._active_task.progress_message.connect(self._on_flow_progress)
-        self._active_task.finished_ok.connect(self._on_flow_ready)
-        self._active_task.finished_err.connect(
-            lambda e: self._show_progress_error("Flujo acumulado", e)
-        )
         self._show_progress_dialog("Calcular flujo acumulado", step=1, total=1)
-        QgsApplication.taskManager().addTask(self._active_task)
+
+        # NOTA IMPORTANTE: r.fill.dir y r.watershed (proveedor GRASS) NO son
+        # seguros de ejecutar dentro de un QgsTask (hilo en segundo plano) —
+        # QGIS termina bloqueando el hilo principal esperando al subproceso
+        # de GRASS de todas formas, y la app queda "sin responder" durante
+        # horas sin ninguna forma de cancelar (síntoma reportado: el paso 2
+        # se cuelga). Se ejecuta aquí síncrono en el hilo principal, pero
+        # bombeando QgsApplication.processEvents() desde el callback de
+        # progreso para que la ventana no se marque "No responde" y el
+        # botón Cancelar del diálogo de progreso siga siendo clickeable
+        # entre llamadas a GRASS (ver WatershedDelineator._run()).
+        self._sync_cancel_requested = False
+
+        def _progress_cb(msg: str) -> None:
+            self._on_flow_progress(msg)
+            try:
+                QgsApplication.processEvents()
+            except Exception:
+                pass
+
+        try:
+            from ..core.watershed_delineator import WatershedDelineator
+            d = WatershedDelineator(
+                dem_path    = self._dem_path,
+                output_dir  = out,
+                fat         = fat,
+                progress_cb = _progress_cb,
+                cancel_cb   = lambda: self._sync_cancel_requested,
+            )
+            acc_path = d.calculate_flow_accumulation()
+            self._delineator = d   # el paso 3 reutiliza el flujo ya calculado
+            self._on_flow_ready(acc_path)
+        except Exception as exc:
+            import traceback
+            detail = traceback.format_exc()
+            log.error(f"_on_calc_flow:\n{detail}")
+            self.btn_calc_flow.setEnabled(True)
+            self._show_progress_error("Flujo acumulado", f"{exc}\n\nDetalle:\n{detail}")
 
     def _on_flow_progress(self, msg: str) -> None:
         self._log(msg)
@@ -1294,11 +1800,9 @@ class MainDialog(QDockWidget):
         self._update_progress(value, subtitle or msg)
 
     def _on_flow_ready(self, acc_path: str) -> None:
-        """Se llama cuando el flujo acumulado termina."""
-        # Conservar el delineator para que la delimitacion reutilice
-        # el flujo ya calculado (la barra continua desde 25%)
-        self._delineator = getattr(self._active_task, "delineator", None)
-        self._active_task = None
+        """Se llama cuando el flujo acumulado termina (síncrono en el hilo
+        principal — ver _on_calc_flow). self._delineator ya fue asignado
+        ahí, para que el paso 3 reutilice el flujo ya calculado."""
         self._flow_acc_path = acc_path
         if not self._alive():
             return
@@ -1363,24 +1867,42 @@ class MainDialog(QDockWidget):
 
         self._ws_step = 0
         self._set_status("Delimitando", "Procesando delimitación de la cuenca...")
-
-        # Guardar referencia — sin esto Python destruye el task
-        # antes de que el hilo lo ejecute (garbage collection)
-        self._active_task = WatershedDelimitationTask(
-            dem_path   = self._dem_path,
-            outlet_lon = self._outlet_lon,
-            outlet_lat = self._outlet_lat,
-            output_dir = out,
-            fat        = fat,
-            delineator = self._delineator,   # reutiliza flujo calculado
-        )
-        self._active_task.progress_message.connect(self._on_ws_progress)
-        self._active_task.finished_ok.connect(self._on_ws_ready)
-        self._active_task.finished_err.connect(
-            lambda e: self._err("Delimitacion", e)
-        )
         self._show_progress_dialog("Delimitar cuenca", step=1, total=1)
-        QgsApplication.taskManager().addTask(self._active_task)
+
+        # Mismo motivo que en _on_calc_flow: r.water.outlet/r.to.vect
+        # (GRASS) tampoco son seguros dentro de un QgsTask — se ejecutan
+        # síncronos en el hilo principal, bombeando eventos Qt.
+        self._sync_cancel_requested = False
+
+        def _progress_cb(msg: str) -> None:
+            self._on_ws_progress(msg)
+            try:
+                QgsApplication.processEvents()
+            except Exception:
+                pass
+
+        try:
+            from ..core.watershed_delineator import WatershedDelineator
+            if self._delineator is not None:
+                d = self._delineator
+                d._cb = _progress_cb
+                d._cancel_cb = lambda: self._sync_cancel_requested
+            else:
+                d = WatershedDelineator(
+                    dem_path    = self._dem_path,
+                    output_dir  = out,
+                    fat         = fat,
+                    progress_cb = _progress_cb,
+                    cancel_cb   = lambda: self._sync_cancel_requested,
+                )
+            result = d.delineate_from_outlet(self._outlet_lon, self._outlet_lat)
+            self._on_ws_ready(result)
+        except Exception as exc:
+            import traceback
+            detail = traceback.format_exc()
+            log.error(f"_on_delineate:\n{detail}")
+            self.btn_delineate.setEnabled(True)
+            self._show_progress_error("Delimitación", f"{exc}\n\nDetalle:\n{detail}")
 
     def _on_ws_progress(self, msg: str) -> None:
         self._log(msg)
@@ -1391,7 +1913,6 @@ class MainDialog(QDockWidget):
 
     def _on_ws_ready(self, result) -> None:
         self._ws_result = result
-        self._active_task = None   # liberar referencia
         if not self._alive():
             return
         try:
@@ -1477,18 +1998,30 @@ class MainDialog(QDockWidget):
             variables     = variables,
             output_dir    = os.path.join(out, "estaciones"),
         )
-        self._active_task.progress_message.connect(self._log)
+        self._active_task.progress_message.connect(self._on_stations_progress)
         self._active_task.finished_ok.connect(self._on_stations_ready)
         self._active_task.finished_err.connect(
-            lambda e: self._err("Estaciones", e)
+            lambda e: self._show_progress_error("Estaciones", e)
         )
+        # A diferencia de los demás pasos, este NO mostraba el diálogo de
+        # progreso: si fallaba o encontraba 0 estaciones, el único rastro
+        # quedaba en el log y parecía que el botón "no hacía nada".
+        self._show_progress_dialog("Buscar estaciones IDEAM", step=1, total=1)
         QgsApplication.taskManager().addTask(self._active_task)
+
+    def _on_stations_progress(self, msg: str) -> None:
+        self._log(msg)
+        if not self._alive():
+            return
+        value, subtitle = self._parse_task_progress(msg, task="stations")
+        self._update_progress(value, subtitle or msg)
 
     def _on_stations_ready(self, shp_path: str, data: dict) -> None:
         self._active_task = None
         if not self._alive():
             return
         try:
+            self._close_progress_dialog()
             self.btn_stations.setEnabled(True)
             total = sum(r.get("n_total", 0) for r in data.get("resumen", []))
             self._log(f"Estaciones encontradas: {total}")
@@ -1502,10 +2035,25 @@ class MainDialog(QDockWidget):
                 if lyr.isValid():
                     self._apply_stations_symbology(lyr)
                     QgsProject.instance().addMapLayer(lyr)
+            if total == 0:
+                # Sin esto, 0 resultados se veía exactamente igual que el
+                # botón "no haciendo nada": no se carga ninguna capa, no
+                # hay error, y el paso igual queda marcado como hecho.
+                msg = (
+                    "No se encontró ninguna estación IDEAM con el buffer y "
+                    "filtro de estado actuales. Pruebe un buffer mayor, "
+                    "'Todas' en estado, o revise que la cuenca esté dentro "
+                    "de Colombia."
+                )
+                self._log(f"  Advertencia: {msg}")
+                self._set_status("Sin resultados", msg)
+                QMessageBox.warning(self, "Sin estaciones", msg)
+            else:
+                self._set_status("Completado", f"{total} estación(es) IDEAM encontradas.")
             self._stations_done = True
             self._save_session()
-        except (RuntimeError, Exception) as exc:
-            log.info(f"_on_stations_ready: {exc}")
+        except RuntimeError:
+            pass
 
     # ------------------------------------------------------------------
     # Paso 6 — Morfometría, Tc adoptado (Kirpich) y comparación de métodos
@@ -1703,6 +2251,8 @@ class MainDialog(QDockWidget):
             "land_cover_clip_path":   self._land_cover_clip_path,
             "land_cover_raster_path": self._land_cover_raster_path,
             "land_cover_cn_raster_path": self._land_cover_cn_raster_path,
+            "soil_path":              self._soil_path,
+            "soil_clip_path":         self._soil_clip_path,
             "stations_done":          self._stations_done,
             "morphometry_csv":        self._morphometry_csv,
             "tc_adopted_min":         self._tc_adopted_min,
@@ -1794,6 +2344,29 @@ class MainDialog(QDockWidget):
             except Exception as exc:
                 self._log(f"No se pudo restaurar el recorte de cobertura: {exc}")
 
+        self._soil_path = state.get("soil_path")
+        if self._soil_path:
+            self.edit_soil.setText(self._soil_path)
+            self.btn_load_soil.setEnabled(True)
+
+        soil_clip_path = state.get("soil_clip_path")
+        if soil_clip_path and os.path.exists(soil_clip_path):
+            self._soil_clip_path = soil_clip_path
+            try:
+                soil_gdf = self._soil_gdf()
+                fields = [c for c in soil_gdf.columns if c != "geometry"]
+                n = len(soil_gdf)
+                self.lbl_soil.setText(f"Suelos restaurados: {n} polígonos en la cuenca.")
+                self.lbl_soil.setStyleSheet("color:#2a7a2a;font-weight:bold;")
+                self.combo_soil_field.clear()
+                self.combo_soil_field.addItems(fields)
+                self.combo_soil_field.setEnabled(bool(fields))
+                if fields:
+                    self.combo_soil_field.setCurrentIndex(0)
+                    self._on_soil_field_selected(0)
+            except Exception as exc:
+                self._log(f"No se pudo restaurar el recorte de suelos: {exc}")
+
         self._stations_done = bool(state.get("stations_done"))
 
         self._morphometry_csv = state.get("morphometry_csv")
@@ -1840,6 +2413,14 @@ class MainDialog(QDockWidget):
         self.btn_delineate.setEnabled(has_flow and has_outlet)
         self.btn_load_land_cover.setEnabled(bool(self.edit_land_cover.text().strip()))
         self.btn_process_cover.setEnabled(has_ws and has_cover)
+        self.btn_load_soil.setEnabled(has_ws and bool(self.edit_soil.text().strip()))
+        has_soil_classified = (
+            self._soil_clip_gdf is not None
+            and self.table_soil_condition.rowCount() > 0
+        )
+        self.btn_calc_cn_final.setEnabled(
+            has_ws and has_soil_classified and self._clip_gdf() is not None
+        )
         self.btn_stations.setEnabled(has_ws)
         has_drenajes = has_ws and bool(getattr(self._ws_result, "drenajes_shp", None))
         self.btn_morphometry.setEnabled(has_drenajes)
@@ -1859,6 +2440,15 @@ class MainDialog(QDockWidget):
 
     def _on_progress_canceled(self) -> None:
         if self._active_task is None:
+            # Pasos 2/3 (GRASS) corren síncronos en el hilo principal —
+            # ver _on_calc_flow/_on_delineate. No hay QgsTask que cancelar;
+            # se marca la bandera que WatershedDelineator revisa ENTRE
+            # llamadas a GRASS (r.fill.dir -> r.watershed -> ...). No
+            # interrumpe una llamada a GRASS ya en curso (processing.run()
+            # es bloqueante de principio a fin), solo evita que arranque
+            # la siguiente.
+            self._sync_cancel_requested = True
+            self._log("Cancelación solicitada — se detendrá antes del próximo paso de GRASS.")
             return
         try:
             self._log("Cancelando tarea en segundo plano...")
@@ -2066,6 +2656,16 @@ class MainDialog(QDockWidget):
             import geopandas as gpd
             self._land_cover_clip_gdf = gpd.read_file(self._land_cover_clip_path)
             return self._land_cover_clip_gdf
+        return None
+
+    def _soil_gdf(self):
+        """GeoDataFrame del recorte suelos∩cuenca (memoria o GPKG en disco)."""
+        if self._soil_clip_gdf is not None:
+            return self._soil_clip_gdf
+        if self._soil_clip_path and os.path.exists(self._soil_clip_path):
+            import geopandas as gpd
+            self._soil_clip_gdf = gpd.read_file(self._soil_clip_path)
+            return self._soil_clip_gdf
         return None
 
     def _on_cover_field_selected(self, index: int) -> None:

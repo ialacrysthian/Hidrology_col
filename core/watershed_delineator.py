@@ -50,11 +50,16 @@ class WatershedDelineator:
         output_dir: str,
         fat: int = 500,
         progress_cb: Callable[[str], None] | None = None,
+        cancel_cb: Callable[[], bool] | None = None,
     ) -> None:
         self.dem_path   = dem_path
         self.output_dir = output_dir
         self.fat        = fat
         self._cb        = progress_cb or log.info
+        # Cancelación cooperativa: se consulta ENTRE llamadas a GRASS (no
+        # puede interrumpir una ya en curso — ver nota en _run()). Sin esto
+        # el único recurso del usuario ante un cálculo largo es matar QGIS.
+        self._cancel_cb = cancel_cb or (lambda: False)
         os.makedirs(output_dir, exist_ok=True)
         self._tmp = tempfile.mkdtemp(prefix="tc_ws_")
 
@@ -165,6 +170,15 @@ class WatershedDelineator:
     def _run(self, alg_id: str, params: dict) -> dict:
         import processing
         from qgis.core import QgsProcessingContext, QgsProcessingFeedback
+
+        # Cancelación cooperativa ENTRE llamadas a GRASS. processing.run()
+        # es una llamada bloqueante de principio a fin: una vez que GRASS
+        # arranca (r.fill.dir, r.watershed, r.water.outlet...) no hay forma
+        # de interrumpirla desde Python — QgsTask.cancel() NO llega al
+        # subproceso de GRASS. Por eso se revisa solo al INICIO de cada
+        # paso, nunca durante uno ya en curso.
+        if self._cancel_cb():
+            raise RuntimeError("Cancelado por el usuario.")
 
         ctx      = QgsProcessingContext()
         feedback = QgsProcessingFeedback()
